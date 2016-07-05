@@ -26,6 +26,13 @@ local: *.go
 arm:
 	GOOS=linux GOARCH=arm $(GO) build -ldflags "-X main.Version=$(VERSION)" -o build/kuisp-linux-arm
 
+linux:
+	GOOS=linux $(GO) build -ldflags "-X main.Version=$(VERSION)" -o build/kuisp-linux
+
+
+updatedeps:
+	glide up --update-vendored
+
 bump:
 	$(GO) get -u github.com/fabric8io/gobump
 	gobump patch

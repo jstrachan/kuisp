@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -31,6 +32,8 @@ import (
 
 	"github.com/gorilla/handlers"
 	"github.com/jackspirou/syscerts"
+	"github.com/koding/websocketproxy"
+
 	flag "github.com/spf13/pflag"
 )
 
@@ -51,6 +54,7 @@ type Options struct {
 	CompressHandler       bool
 	BearerTokenFile       string
 	ServeWww              bool
+	EnableCORS            bool
 }
 
 var options = &Options{}
@@ -71,6 +75,7 @@ func initFlags() {
 	flag.BoolVar(&options.CompressHandler, "compress", false, "Enable gzip/deflate response compression")
 	flag.BoolVar(&options.FailOnUnknownServices, "fail-on-unknown-services", false, "Fail on unknown services in DNS")
 	flag.BoolVar(&options.ServeWww, "serve-www", true, "Whether to serve static content")
+	flag.BoolVar(&options.EnableCORS, "cors", false, "Whether to enable CORS")
 	flag.StringVar(&options.BearerTokenFile, "bearer-token", "", "Specify the file to use as the Bearer token for Authorization header")
 	flag.Parse()
 }
@@ -122,19 +127,83 @@ func main() {
 			rp := httputil.NewSingleHostReverseProxy(serviceDef.url)
 			rp.Transport = transport
 			handler := http.StripPrefix(serviceDef.prefix, rp)
+
+			authHeader := ""
+			token := ""
 			if len(options.BearerTokenFile) > 0 {
 				data, err := ioutil.ReadFile(options.BearerTokenFile)
 				if err != nil {
 					log.Fatalf("Could not load Bearer token file %s due to %v", options.BearerTokenFile, err)
 				}
-				authHeader := "Bearer " + string(data)
+				token = string(data)
+				authHeader = "Bearer " + token
+			}
+			if len(authHeader) > 0 {
 				oldHandler := handler
-				newHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					r.Header.Set("Authorization", authHeader)
+					if options.EnableCORS {
+						w.Header().Set("Access-Control-Allow-Origin", "*")
+					}
 					oldHandler.ServeHTTP(w, r)
 				})
-				handler = newHandler
 			}
+			enabled := true
+			nextHandler := handler
+			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if enabled && isWebsocket(r) {
+					target := serviceDef.url.Host
+					// shallow copy
+					u := *r.URL
+					u.Scheme = "wss"
+					u.Host = target
+					u.Fragment = r.URL.Fragment
+					u.Path = r.URL.Path
+					u.RawQuery = r.URL.RawQuery
+
+					// lets add the token if its missing
+					parameters := u.Query()
+					if len(token) > 0 {
+						tokenParam := parameters.Get("access_token")
+						if len(tokenParam) == 0 {
+							parameters.Set("access_token", token)
+							u.RawQuery = parameters.Encode()
+						}
+					}
+					log.Printf("Creating websocket proxy for target %s to %v\n", target, &u)
+
+					// shallow copy
+					pr := *r
+					pr.URL = &u
+
+					/*
+					if len(authHeader) > 0 {
+						r.Header.Set("Authorization", authHeader)
+					}
+					if options.EnableCORS {
+						w.Header().Set("Access-Control-Allow-Origin", "*")
+					}
+					*/
+					proxy := websocketproxy.NewProxy(&u)
+					if options.SkipCertValidation {
+						if proxy.Dialer == nil {
+							proxy.Dialer = websocketproxy.DefaultDialer
+						}
+
+						if proxy.Dialer.TLSClientConfig == nil {
+							proxy.Dialer.TLSClientConfig = tlsConfig
+						} else {
+							proxy.Dialer.TLSClientConfig.InsecureSkipVerify = true
+						}
+					}
+					proxy.ServeHTTP(w, &pr)
+					return
+				}
+				log.Printf("Serving regular http traffic on %v\n", r.URL)
+				nextHandler.ServeHTTP(w, r)
+				return
+			})
+
 			http.Handle(serviceDef.prefix, handler)
 		}
 		log.Println()
@@ -178,6 +247,66 @@ func main() {
 	} else {
 		log.Fatal(srv.ListenAndServe())
 	}
+}
+
+func isWebsocket(req *http.Request) bool {
+	if req.URL.Scheme == "ws" || req.URL.Scheme == "wss" || req.URL.Query().Get("watch") == "true" {
+		return true
+	}
+	conn_hdr := ""
+	conn_hdrs := req.Header["Connection"]
+	if len(conn_hdrs) > 0 {
+		conn_hdr = conn_hdrs[0]
+	}
+
+	upgrade_websocket := false
+	if strings.ToLower(conn_hdr) == "upgrade" {
+		upgrade_hdrs := req.Header["Upgrade"]
+		if len(upgrade_hdrs) > 0 {
+			upgrade_websocket = (strings.ToLower(upgrade_hdrs[0]) == "websocket")
+		}
+	}
+
+	return upgrade_websocket
+}
+
+func websocketProxy(target string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d, err := net.Dial("tcp", target)
+		if err != nil {
+			http.Error(w, "Error contacting backend server.", 500)
+			log.Printf("Error dialing websocket backend %s: %v", target, err)
+			return
+		}
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "Not a hijacker?", 500)
+			log.Printf("Not a hijacker?")
+			return
+		}
+		nc, _, err := hj.Hijack()
+		if err != nil {
+			log.Printf("Hijack error: %v", err)
+			return
+		}
+		defer nc.Close()
+		defer d.Close()
+
+		err = r.Write(d)
+		if err != nil {
+			log.Printf("Error copying request to target: %v", err)
+			return
+		}
+
+		errc := make(chan error, 2)
+		cp := func(dst io.Writer, src io.Reader) {
+			_, err := io.Copy(dst, src)
+			errc <- err
+		}
+		go cp(d, nc)
+		go cp(nc, d)
+		<-errc
+	})
 }
 
 func defaultPageHandler(defaultPage string, httpDir http.Dir, fsHandler http.Handler) http.Handler {
