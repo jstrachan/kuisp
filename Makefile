@@ -31,7 +31,7 @@ linux:
 
 
 updatedeps:
-	glide up --update-vendored
+	glide up --update-vendored -strip-vcs
 
 bump:
 	$(GO) get -u github.com/fabric8io/gobump
