@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"log"
 )
 
 // ErrBadHandshake is returned when the server response to opening handshake is
@@ -101,11 +102,22 @@ func parseURL(s string) (*url.URL, error) {
 		s = s[:i]
 	}
 
+	/*
+	TODO this should be path right?
 	if i := strings.Index(s, "/"); i >= 0 {
 		u.Opaque = s[i:]
 		s = s[:i]
 	} else {
 		u.Opaque = "/"
+	}
+
+	The following change fixes: https://github.com/gorilla/websocket/issues/147
+	*/
+	if i := strings.Index(s, "/"); i >= 0 {
+		u.Path = s[i:]
+		s = s[:i]
+	} else {
+		u.Path = "/"
 	}
 
 	u.Host = s
@@ -183,6 +195,7 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header) (*Conn, *http.Re
 		return nil, nil, errMalformedURL
 	}
 
+	log.Printf("About to GET url %v\n",  u)
 	req := &http.Request{
 		Method:     "GET",
 		URL:        u,

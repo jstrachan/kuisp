@@ -19,12 +19,12 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"path"
 	"strings"
@@ -33,6 +33,7 @@ import (
 	"github.com/gorilla/handlers"
 	"github.com/jackspirou/syscerts"
 	"github.com/koding/websocketproxy"
+	"github.com/gorilla/websocket"
 
 	flag "github.com/spf13/pflag"
 )
@@ -148,18 +149,14 @@ func main() {
 					oldHandler.ServeHTTP(w, r)
 				})
 			}
-			enabled := true
 			nextHandler := handler
 			handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if enabled && isWebsocket(r) {
-					target := serviceDef.url.Host
+				if isWebsocket(r) {
 					// shallow copy
 					u := *r.URL
+					u.Host = serviceDef.url.Host
 					u.Scheme = "wss"
-					u.Host = target
-					u.Fragment = r.URL.Fragment
-					u.Path = r.URL.Path
-					u.RawQuery = r.URL.RawQuery
+					u.Path = strings.TrimPrefix(u.Path, serviceDef.prefix)
 
 					// lets add the token if its missing
 					parameters := u.Query()
@@ -170,7 +167,7 @@ func main() {
 							u.RawQuery = parameters.Encode()
 						}
 					}
-					log.Printf("Creating websocket proxy for target %s to %v\n", target, &u)
+					log.Printf("Creating websocket proxy to %v\n", &u)
 
 					// shallow copy
 					pr := *r
@@ -185,21 +182,18 @@ func main() {
 					}
 					*/
 					proxy := websocketproxy.NewProxy(&u)
-					if options.SkipCertValidation {
-						if proxy.Dialer == nil {
-							proxy.Dialer = websocketproxy.DefaultDialer
-						}
-
-						if proxy.Dialer.TLSClientConfig == nil {
-							proxy.Dialer.TLSClientConfig = tlsConfig
-						} else {
-							proxy.Dialer.TLSClientConfig.InsecureSkipVerify = true
-						}
+					proxy.Dialer = &websocket.Dialer{
+						Proxy: func(r *http.Request) (*url.URL, error) {
+							return &u, nil
+						},
 					}
+
+					// lets use the same TLS config?
+					//proxy.Dialer.TLSClientConfig = tlsConfig
 					proxy.ServeHTTP(w, &pr)
 					return
 				}
-				log.Printf("Serving regular http traffic on %v\n", r.URL)
+				//log.Printf("Serving regular http traffic on %v\n", r.URL)
 				nextHandler.ServeHTTP(w, r)
 				return
 			})
@@ -268,45 +262,6 @@ func isWebsocket(req *http.Request) bool {
 	}
 
 	return upgrade_websocket
-}
-
-func websocketProxy(target string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		d, err := net.Dial("tcp", target)
-		if err != nil {
-			http.Error(w, "Error contacting backend server.", 500)
-			log.Printf("Error dialing websocket backend %s: %v", target, err)
-			return
-		}
-		hj, ok := w.(http.Hijacker)
-		if !ok {
-			http.Error(w, "Not a hijacker?", 500)
-			log.Printf("Not a hijacker?")
-			return
-		}
-		nc, _, err := hj.Hijack()
-		if err != nil {
-			log.Printf("Hijack error: %v", err)
-			return
-		}
-		defer nc.Close()
-		defer d.Close()
-
-		err = r.Write(d)
-		if err != nil {
-			log.Printf("Error copying request to target: %v", err)
-			return
-		}
-
-		errc := make(chan error, 2)
-		cp := func(dst io.Writer, src io.Reader) {
-			_, err := io.Copy(dst, src)
-			errc <- err
-		}
-		go cp(d, nc)
-		go cp(nc, d)
-		<-errc
-	})
 }
 
 func defaultPageHandler(defaultPage string, httpDir http.Dir, fsHandler http.Handler) http.Handler {
