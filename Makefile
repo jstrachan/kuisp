@@ -26,6 +26,9 @@ local: *.go
 arm:
 	GOOS=linux GOARCH=arm $(GO) build -ldflags "-X main.Version=$(VERSION)" -o build/kuisp-linux-arm
 
+linux:
+	GOOS=linux $(GO) build -ldflags "-X main.Version=$(VERSION)" -o build/kuisp-linux
+
 release:
 	$(GO) get -u github.com/progrium/gh-release
 	rm -rf build release && mkdir build release

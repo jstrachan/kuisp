@@ -144,8 +144,22 @@ func main() {
 				} else {
 					req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
 				}
+				log.Printf("About to query host %v with path %v with prefix %v\n", req.URL.Host, req.URL.Path, serviceDef.prefix)
 				fwd.ServeHTTP(w, req)
 			}))
+			if len(options.BearerTokenFile) > 0 {
+				data, err := ioutil.ReadFile(options.BearerTokenFile)
+				if err != nil {
+					log.Fatalf("Could not load Bearer token file %s due to %v", options.BearerTokenFile, err)
+				}
+				authHeader := "Bearer " + string(data)
+				oldHandler := handler
+				newHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					r.Header.Set("Authorization", authHeader)
+					oldHandler.ServeHTTP(w, r)
+				})
+				handler = newHandler
+			}
 			http.Handle(serviceDef.prefix, handler)
 		}
 	}
